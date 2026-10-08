@@ -12,7 +12,7 @@ def configured_env(monkeypatch):
         "VPN_API_TOKEN": "local-test-gateway-token-with-32-characters",
         "SUPPORT_USERNAME": "@vpn_support",
     }
-    for key in [*values, "ADMIN_IDS", "DATABASE_PATH"]:
+    for key in [*values, "ADMIN_IDS", "DATABASE_PATH", "SALES_ENABLED"]:
         monkeypatch.delenv(key, raising=False)
     for key, value in values.items():
         monkeypatch.setenv(key, value)
@@ -39,6 +39,34 @@ def test_settings_keep_30_days_200_ruble_label_and_explicit_star_amount(configur
     assert settings.stars_price == 140
     assert settings.support_username == "vpn_support"
     assert settings.vpn_api_url == "http://127.0.0.1:8081"
+
+
+def test_sales_are_disabled_without_explicit_environment_setting(configured_env):
+    assert Settings.from_env().sales_enabled is False
+
+
+def test_direct_settings_constructor_defaults_to_disabled_sales(configured_env):
+    settings = Settings(
+        bot_token=configured_env["BOT_TOKEN"],
+        stars_price=140,
+        vpn_api_url=configured_env["VPN_API_URL"],
+        vpn_api_token=configured_env["VPN_API_TOKEN"],
+        support_username="vpn_support",
+    )
+    assert settings.sales_enabled is False
+
+
+@pytest.mark.parametrize(("value", "expected"), [("true", True), ("false", False)])
+def test_sales_setting_accepts_explicit_boolean_strings(configured_env, monkeypatch, value, expected):
+    monkeypatch.setenv("SALES_ENABLED", value)
+    assert Settings.from_env().sales_enabled is expected
+
+
+@pytest.mark.parametrize("value", ["", "1", "0", "yes", "no", "TRUE", "False", " true "])
+def test_sales_setting_rejects_ambiguous_values(configured_env, monkeypatch, value):
+    monkeypatch.setenv("SALES_ENABLED", value)
+    with pytest.raises(ValueError, match="SALES_ENABLED"):
+        Settings.from_env()
 
 
 def test_setting_repr_does_not_expose_bot_or_gateway_credentials(configured_env):

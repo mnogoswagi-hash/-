@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from contextlib import suppress
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -95,6 +96,7 @@ def app(tmp_path):
         vpn_api_token="A" * 32,
         support_username="support_test",
         database_path=tmp_path / "shop.sqlite",
+        sales_enabled=True,
     )
     store = Store(settings.database_path)
     vpn = AsyncMock()
@@ -108,6 +110,14 @@ def app(tmp_path):
     dispatcher.include_router(create_router(settings, store, vpn, delivery))
     yield settings, store, vpn, session, bot, delivery, dispatcher
     store.close()
+
+
+def configured_app(app, **settings_changes):
+    settings, store, vpn, session, bot, delivery, _ = app
+    settings = replace(settings, **settings_changes)
+    dispatcher = Dispatcher()
+    dispatcher.include_router(create_router(settings, store, vpn, delivery))
+    return settings, store, vpn, session, bot, delivery, dispatcher
 
 
 async def feed_callback(app, data, *, user_id=1, owner_id=1):
@@ -362,3 +372,163 @@ async def test_malformed_successful_payment_is_durably_recorded(app):
     assert rows[0]["update_id"] == update.update_id
     await persist_paid_update(update, store)
     assert store.connection.execute("SELECT count(*) FROM payment_incidents").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("command", ["/start", "/buy"])
+async def test_disabled_sales_show_testing_message_without_purchase_keyboard(app, command):
+    app = configured_app(app, sales_enabled=False)
+    _, _, vpn, session, bot, _, dispatcher = app
+    await dispatcher.feed_update(bot, Update(update_id=1, message=private_message(text=command)))
+    reply = next(item for item in session.requests if isinstance(item, SendMessage))
+    assert "проходит проверку" in reply.text
+    assert reply.reply_markup is None
+    assert "⭐" not in reply.text
+    vpn.health.assert_not_called()
+    vpn.ensure_access.assert_not_called()
+
+
+async def test_disabled_sales_prevent_new_invoices_even_from_old_acceptance_buttons(app):
+    app = configured_app(app, sales_enabled=False)
+    _, store, vpn, session, *_ = app
+    await feed_callback(app, "accept:1:android")
+    assert not any(isinstance(item, SendInvoice) for item in session.requests)
+    assert store.connection.execute("SELECT count(*) FROM orders").fetchone()[0] == 0
+    vpn.health.assert_not_called()
+    vpn.prepare_access.assert_not_called()
+
+
+async def test_disabled_sales_reject_checkout_of_an_existing_valid_invoice(app):
+    app = configured_app(app, sales_enabled=False)
+    _, store, vpn, session, bot, _, dispatcher = app
+    order = store.create_order(1, 1, "android", 80)
+    await dispatcher.feed_update(
+        bot,
+        Update(
+            update_id=1,
+            pre_checkout_query=PreCheckoutQuery(
+                id="old-checkout",
+                from_user=User(id=1, is_bot=False, first_name="Test"),
+                currency="XTR",
+                total_amount=80,
+                invoice_payload=f"vpn30:{order.id}",
+            ),
+        ),
+    )
+    answer = next(item for item in session.requests if isinstance(item, AnswerPreCheckoutQuery))
+    assert answer.ok is False
+    assert "проверку" in answer.error_message
+    assert store.get_subscription(1) is None
+    vpn.health.assert_not_called()
+    vpn.prepare_access.assert_not_called()
+
+
+async def test_disabled_sales_still_credit_paid_receipts_and_retry_delivery(app):
+    app = configured_app(app, sales_enabled=False)
+    _, store, vpn, session, bot, delivery, dispatcher = app
+    order = store.create_order(1, 1, "android", 80)
+    vpn.ensure_access.side_effect = VPNUnavailable("Test gateway outage")
+    await dispatcher.feed_update(bot, paid_update(order))
+    assert store.get_subscription(1) is not None
+    assert len(store.pending_subscriptions()) == 1
+    vpn.ensure_access.side_effect = None
+    await delivery.deliver(1)
+    assert not store.pending_subscriptions()
+    assert any(isinstance(item, SendDocument) for item in session.requests)
+
+
+async def test_testvpn_requires_admin_id_and_does_not_authorize_support_username(app):
+    app = configured_app(app, sales_enabled=False, admin_ids=(2,))
+    settings, store, vpn, session, bot, _, dispatcher = app
+    message = private_message(text="/testvpn android").model_copy(
+        update={
+            "from_user": User(
+                id=1,
+                is_bot=False,
+                first_name="Test",
+                username=settings.support_username,
+            )
+        }
+    )
+    await dispatcher.feed_update(bot, Update(update_id=1, message=message))
+    vpn.ensure_access.assert_not_called()
+    assert not any(isinstance(item, SendDocument) for item in session.requests)
+    assert store.get_subscription(1) is None
+    assert "администратору" in session.requests[-1].text
+
+
+@pytest.mark.parametrize(
+    "command,platform",
+    [("/testvpn", "android"), ("/testvpn android", "android"), ("/testvpn ios", "ios")],
+)
+async def test_admin_gets_one_hour_profile_without_purchase_or_charge(app, command, platform):
+    app = configured_app(app, sales_enabled=False, admin_ids=(1,))
+    _, store, vpn, session, bot, _, dispatcher = app
+    before = datetime.now(timezone.utc)
+    await dispatcher.feed_update(bot, Update(update_id=1, message=private_message(text=command)))
+    vpn.ensure_access.assert_awaited_once()
+    user_id, expiry = vpn.ensure_access.await_args.args
+    assert user_id == 1
+    assert before + timedelta(hours=1) <= expiry <= datetime.now(timezone.utc) + timedelta(hours=1)
+    document = next(item for item in session.requests if isinstance(item, SendDocument))
+    assert document.document.data == f"{platform}-profile".encode()
+    assert document.document.filename == f"brawl-stars-{platform}.conf"
+    assert document.protect_content is False
+    assert "Профиль для проверки" in document.caption
+    assert "WireGuard" in document.caption
+    assert "Не передавайте" in document.caption
+    assert store.get_subscription(1) is None
+    assert store.connection.execute("SELECT count(*) FROM orders").fetchone()[0] == 0
+    assert store.connection.execute("SELECT count(*) FROM payments").fetchone()[0] == 0
+    assert not any(isinstance(item, SendInvoice) for item in session.requests)
+
+
+async def test_admin_test_does_not_shorten_or_modify_existing_paid_subscription(app):
+    app = configured_app(app, sales_enabled=False, admin_ids=(1,))
+    _, store, vpn, _, bot, _, dispatcher = app
+    order = store.create_order(1, 1, "android", 80)
+    store.accept_payment(order.id, 1, "XTR", 80, "paid-charge")
+    subscription = store.get_subscription(1)
+    await dispatcher.feed_update(
+        bot, Update(update_id=1, message=private_message(text="/testvpn ios"))
+    )
+    vpn.ensure_access.assert_awaited_once_with(1, subscription.expires_at)
+    assert store.get_subscription(1) == subscription
+    assert store.connection.execute("SELECT count(*) FROM orders").fetchone()[0] == 1
+    assert store.connection.execute("SELECT count(*) FROM payments").fetchone()[0] == 1
+
+
+async def test_admin_test_failure_is_friendly_and_does_not_disclose_gateway_error(app, caplog):
+    app = configured_app(app, sales_enabled=False, admin_ids=(1,))
+    _, store, vpn, session, bot, _, dispatcher = app
+    vpn.ensure_access.side_effect = VPNUnavailable("private-error-detail")
+    await dispatcher.feed_update(
+        bot, Update(update_id=1, message=private_message(text="/testvpn android"))
+    )
+    assert not any(isinstance(item, SendDocument) for item in session.requests)
+    assert "Тестовый профиль временно недоступен" in session.requests[-1].text
+    assert "private-error-detail" not in session.requests[-1].text
+    assert "private-error-detail" not in caplog.text
+    assert store.get_subscription(1) is None
+
+
+@pytest.mark.parametrize("command", ["/testvpn windows", "/testvpn android extra"])
+async def test_admin_test_invalid_platform_does_not_request_access(app, command):
+    app = configured_app(app, admin_ids=(1,))
+    _, _, vpn, session, bot, _, dispatcher = app
+    await dispatcher.feed_update(bot, Update(update_id=1, message=private_message(text=command)))
+    vpn.ensure_access.assert_not_called()
+    assert "Для проверки" in session.requests[-1].text
+
+
+@pytest.mark.parametrize("chat_id,chat_type", [(-100, "supergroup"), (2, "private")])
+async def test_admin_test_cannot_deliver_profiles_outside_admins_own_private_chat(
+    app, chat_id, chat_type
+):
+    app = configured_app(app, admin_ids=(1,))
+    _, _, vpn, session, bot, _, dispatcher = app
+    message = private_message(text="/testvpn").model_copy(
+        update={"chat": Chat(id=chat_id, type=chat_type)}
+    )
+    await dispatcher.feed_update(bot, Update(update_id=1, message=message))
+    vpn.ensure_access.assert_not_called()
+    assert not any(isinstance(item, SendDocument) for item in session.requests)

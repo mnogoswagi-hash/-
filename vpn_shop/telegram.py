@@ -7,7 +7,7 @@ import logging
 import signal
 import sqlite3
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
@@ -32,7 +32,7 @@ from aiogram.types import (
 
 from .config import Settings
 from .db import PaymentResult, Store
-from .provider import VPNClient
+from .provider import VPNAccess, VPNClient
 
 
 log = logging.getLogger(__name__)
@@ -49,6 +49,14 @@ def _price(settings: Settings) -> str:
         f"Доступ на {settings.plan_days} дней — {settings.stars_price} ⭐.\n"
         f"Стоимость в рублях: ориентир {settings.rub_price} ₽. "
         "Списывается указанное число Stars; стоимость покупки Stars зависит от Telegram."
+    )
+
+
+def _sales_paused(settings: Settings) -> str:
+    return (
+        "Магазин проходит проверку. Покупка временно недоступна.\n"
+        "Оплаченный доступ можно получить через /myvpn.\n"
+        f"{_support(settings)}"
     )
 
 
@@ -127,9 +135,19 @@ async def gateway_ready(
 
 
 async def handle_pre_checkout(
-    query: PreCheckoutQuery, store: Store, vpn: VPNClient
+    query: PreCheckoutQuery,
+    store: Store,
+    vpn: VPNClient,
+    *,
+    sales_enabled: bool = True,
 ) -> None:
     """Answer checkout within Telegram's ten-second deadline."""
+    if not sales_enabled:
+        await query.answer(
+            ok=False,
+            error_message="Магазин проходит проверку. Оплата временно недоступна.",
+        )
+        return
     try:
         store.validate_checkout(
             _order_id(query.invoice_payload),
@@ -168,6 +186,58 @@ class DeliveryService:
         self.vpn = vpn
         self._locks: dict[int, asyncio.Lock] = {}
 
+    async def _send_profile(
+        self,
+        chat_id: int,
+        platform: str,
+        access: VPNAccess,
+        expires_at: datetime,
+        *,
+        testing: bool = False,
+    ) -> None:
+        if platform == "android":
+            profile = access.android_config
+            instructions = (
+                "Импортируйте профиль в приложение WireGuard. "
+                "Профиль ограничивает VPN приложением Brawl Stars "
+                "(com.supercell.brawlstars)."
+            )
+            filename = "brawl-stars-android.conf"
+        elif platform == "ios":
+            profile = access.ios_config
+            instructions = (
+                "Импортируйте профиль в приложение WireGuard. "
+                "На iOS маршрутизация ограничивается адресами игры; "
+                "выбрать только приложение Brawl Stars невозможно."
+            )
+            filename = "brawl-stars-ios.conf"
+        else:
+            raise ValueError("Unsupported subscription platform")
+        if not profile:
+            raise ValueError("VPN gateway returned an empty profile")
+        expiry = expires_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        label = "Профиль для проверки" if testing else "Ваш VPN-доступ"
+        await self.bot.send_document(
+            chat_id=chat_id,
+            document=BufferedInputFile(profile.encode("utf-8"), filename=filename),
+            caption=(
+                f"{label} действует до {expiry}.\n\n{instructions}\n\n"
+                "Не передавайте профиль другим людям."
+            ),
+            protect_content=False,
+        )
+
+    async def test_access(self, user_id: int, platform: str) -> None:
+        """Issue an admin's short test without creating a purchase or editing payments."""
+        lock = self._locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+            subscription = self.store.get_subscription(user_id)
+            if subscription is not None:
+                expiry = max(expiry, subscription.expires_at)
+            access = await self.vpn.ensure_access(user_id, expiry)
+            await self._send_profile(user_id, platform, access, expiry, testing=True)
+
     async def deliver(self, user_id: int, *, resend: bool = False) -> bool:
         lock = self._locks.setdefault(user_id, asyncio.Lock())
         async with lock:
@@ -186,37 +256,11 @@ class DeliveryService:
 
             access = await self.vpn.ensure_access(user_id, subscription.expires_at)
             self.store.mark_provisioned(user_id, subscription.expires_at)
-            if subscription.platform == "android":
-                profile = access.android_config
-                instructions = (
-                    "Импортируйте профиль в приложение WireGuard. "
-                    "Профиль ограничивает VPN приложением Brawl Stars "
-                    "(com.supercell.brawlstars)."
-                )
-                filename = "brawl-stars-android.conf"
-            elif subscription.platform == "ios":
-                profile = access.ios_config
-                instructions = (
-                    "Импортируйте профиль в приложение WireGuard. "
-                    "На iOS маршрутизация ограничивается адресами игры; "
-                    "выбрать только приложение Brawl Stars невозможно."
-                )
-                filename = "brawl-stars-ios.conf"
-            else:
-                raise ValueError("Unsupported subscription platform")
-            if not profile:
-                raise ValueError("VPN gateway returned an empty profile")
-            expiry = subscription.expires_at.astimezone(timezone.utc).strftime(
-                "%d.%m.%Y %H:%M UTC"
-            )
-            await self.bot.send_document(
-                chat_id=subscription.chat_id,
-                document=BufferedInputFile(profile.encode("utf-8"), filename=filename),
-                caption=(
-                    f"Ваш VPN-доступ действует до {expiry}.\n\n{instructions}\n\n"
-                    "Не передавайте профиль другим людям."
-                ),
-                protect_content=False,
+            await self._send_profile(
+                subscription.chat_id,
+                subscription.platform,
+                access,
+                subscription.expires_at,
             )
             self.store.mark_notified(user_id, subscription.expires_at)
             return True
@@ -252,6 +296,14 @@ def create_router(
     async def buy(message: Message) -> None:
         if message.from_user is None:
             return
+        if not settings.sales_enabled:
+            admin_help = (
+                "\nПроверка администратора: /testvpn android или /testvpn ios."
+                if message.from_user.id in settings.admin_ids
+                else ""
+            )
+            await message.answer(_sales_paused(settings) + admin_help)
+            return
         await message.answer(
             "VPN для Brawl Stars\n\n"
             f"{_price(settings)}\n\n"
@@ -267,6 +319,9 @@ def create_router(
             await query.answer("Откройте /buy в личном чате с ботом.", show_alert=True)
             return
         await query.answer()
+        if not settings.sales_enabled:
+            await query.message.answer(_sales_paused(settings))
+            return
         await query.message.answer(
             f"Устройство: {PLATFORMS[platform]}\n\n{terms_text(settings)}",
             reply_markup=InlineKeyboardMarkup(
@@ -288,6 +343,9 @@ def create_router(
             await query.answer("Откройте /buy в личном чате с ботом.", show_alert=True)
             return
         await query.answer()
+        if not settings.sales_enabled:
+            await query.message.answer(_sales_paused(settings))
+            return
         if not await gateway_ready(vpn, query.from_user.id):
             await query.message.answer(
                 "VPN-сервер пока не готов к выдаче. Оплата временно недоступна.\n"
@@ -314,7 +372,7 @@ def create_router(
 
     @router.pre_checkout_query()
     async def pre_checkout(query: PreCheckoutQuery) -> None:
-        await handle_pre_checkout(query, store, vpn)
+        await handle_pre_checkout(query, store, vpn, sales_enabled=settings.sales_enabled)
 
     @router.message(F.successful_payment)
     async def successful_payment(
@@ -403,13 +461,46 @@ def create_router(
     async def terms(message: Message) -> None:
         await message.answer(terms_text(settings))
 
+    @router.message(Command("testvpn"))
+    async def test_vpn(message: Message) -> None:
+        if (
+            message.from_user is None
+            or message.from_user.id not in settings.admin_ids
+            or message.chat.id != message.from_user.id
+        ):
+            await message.answer("Команда доступна только администратору в личном чате.")
+            return
+        arguments = (message.text or "").split()
+        platform = arguments[1].lower() if len(arguments) == 2 else "android"
+        if len(arguments) > 2 or platform not in PLATFORMS:
+            await message.answer("Для проверки: /testvpn android или /testvpn ios.")
+            return
+        try:
+            await delivery.test_access(message.from_user.id, platform)
+        except Exception as exc:
+            log.warning(
+                "Admin test profile unavailable for user %s (%s)",
+                message.from_user.id,
+                type(exc).__name__,
+            )
+            await message.answer(
+                "Тестовый профиль временно недоступен. Попробуйте позже.\n"
+                f"{_support(settings)}"
+            )
+
     @router.message(Command("help"))
     async def help_command(message: Message) -> None:
+        admin_help = (
+            "\n/testvpn android|ios — проверить VPN без оплаты (1 час)\n"
+            if message.from_user and message.from_user.id in settings.admin_ids
+            else ""
+        )
         await message.answer(
             "/buy — купить доступ\n"
             "/myvpn — получить свой профиль\n"
             "/terms — условия и ограничения Android / iOS\n"
-            "/paysupport — помощь с оплатой и возвратами\n\n"
+            "/paysupport — помощь с оплатой и возвратами\n"
+            f"{admin_help}\n"
             f"{_support(settings)}"
         )
 

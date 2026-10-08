@@ -65,6 +65,7 @@ def test_private_configs_share_token_and_selected_tariff(prepared):
     gateway = read_env(result.gateway_path)
     assert bot["BOT_TOKEN"] == BOT_TOKEN
     assert bot["STARS_PRICE"] == "100"
+    assert bot["SALES_ENABLED"] == "false"
     assert bot["SUPPORT_USERNAME"] == "my_support"
     assert bot["VPN_API_URL"] == "http://127.0.0.1:8081"
     assert bot["DATABASE_PATH"] == "/var/lib/brawl-vpn-bot/shop.sqlite"
@@ -88,6 +89,7 @@ def test_blank_game_ranges_keep_gateway_unconfigured(prepared):
     result, output = configure(prepared)
     values = read_env(result.gateway_path)
     assert values["GAME_ALLOWED_CIDRS"] == ""
+    assert read_env(result.bot_path)["SALES_ENABLED"] == "false"
     assert not result.game_cidrs_configured
     assert any("не принимает оплату" in line for line in output)
     with pytest.raises(ValueError, match="Missing gateway settings: GAME_ALLOWED_CIDRS"):

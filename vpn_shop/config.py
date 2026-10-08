@@ -29,6 +29,7 @@ class Settings:
     database_path: Path = Path("data/shop.sqlite")
     plan_days: int = 30
     rub_price: int = 200
+    sales_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -45,6 +46,9 @@ class Settings:
             raise ValueError("STARS_PRICE must be a positive integer") from None
         if not 1 <= price <= 100_000:
             raise ValueError("STARS_PRICE must be between 1 and 100000")
+        sales_enabled = os.environ.get("SALES_ENABLED", "false")
+        if sales_enabled not in {"true", "false"}:
+            raise ValueError("SALES_ENABLED must be exactly 'true' or 'false'")
         username = os.environ["SUPPORT_USERNAME"].strip().removeprefix("@")
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username):
             raise ValueError("SUPPORT_USERNAME must be a Telegram username")
@@ -65,5 +69,6 @@ class Settings:
             support_username=username,
             admin_ids=admins,
             database_path=Path(os.environ.get("DATABASE_PATH", "data/shop.sqlite")),
+            sales_enabled=sales_enabled == "true",
         )
 

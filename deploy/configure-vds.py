@@ -182,6 +182,7 @@ def create_draft(*, bot_token: str, support_username: str, public_host: str, gam
     bot = {
         "BOT_TOKEN": bot_token,
         "STARS_PRICE": "100",
+        "SALES_ENABLED": "false",
         "SUPPORT_USERNAME": support_username,
         "VPN_API_URL": "http://127.0.0.1:8081",
         "VPN_API_TOKEN": api_token,
@@ -277,7 +278,7 @@ def configure(*, wireguard_path: Path = Path("/etc/wireguard/wg-brawl.conf"), co
         os.close(directory_fd)
     wireguard = read_wireguard(wireguard_path, run)
     public_interface = detect_egress(run)
-    emit("Настройка: 100 Stars за 30 дней. Секреты не выводятся; сервисы не запускаются.")
+    emit("Настройка: 100 Stars за 30 дней. Продажи отключены до проверки VPN. Секреты не выводятся; сервисы не запускаются.")
     support = prompt("Username поддержки в Telegram (@username): ")
     endpoint = prompt(f"Публичный IPv4 или домен VDS (UDP-порт {wireguard.listen_port}): ")
     cidrs = prompt("Проверенные GAME_ALLOWED_CIDRS через запятую; пусто = VPN и оплаты пока отключены: ")
