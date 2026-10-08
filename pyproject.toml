@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brawl-vpn-shop"
+version = "0.1.0"
+description = "Telegram Stars shop with a restricted WireGuard gateway"
+requires-python = ">=3.10"
+dependencies = [
+  "aiogram==3.31.0",
+  "fastapi==0.142.4",
+  "httpx==0.28.1",
+  "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "pytest-asyncio==1.2.0", "ruff==0.14.0"]
+
+[tool.setuptools.packages.find]
+include = ["vpn_shop*", "vpn_gateway*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+

@@ -1,0 +1,31 @@
+[Unit]
+Description=Restricted WireGuard provisioning gateway
+Wants=network-online.target brawl-vpn-expire.timer
+After=network-online.target wg-quick@wg-brawl.service
+Requires=wg-quick@wg-brawl.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/brawl-vpn
+EnvironmentFile=/etc/brawl-vpn/gateway.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/brawl-vpn/.venv/bin/python -m vpn_gateway.api
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/brawl-vpn /run/xtables.lock
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

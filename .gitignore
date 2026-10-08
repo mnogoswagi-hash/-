@@ -1,0 +1,17 @@
+.venv/
+.env
+*.env
+!.env.example
+*.sqlite*
+*.db*
+*.conf
+!deploy/brawl-vpn-tmpfiles.conf
+*.key
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+data/
+

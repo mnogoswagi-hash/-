@@ -1,0 +1,30 @@
+[Unit]
+Description=Brawl VPN Telegram Stars subscription bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=brawl-vpn
+Group=brawl-vpn
+WorkingDirectory=/opt/brawl-vpn
+EnvironmentFile=/etc/brawl-vpn/bot.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/brawl-vpn/.venv/bin/python -m vpn_shop
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/brawl-vpn-bot
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
