@@ -8,6 +8,7 @@ import signal
 import sqlite3
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+from html import escape
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
@@ -195,6 +196,49 @@ class DeliveryService:
         *,
         testing: bool = False,
     ) -> None:
+        expiry = expires_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        label = "Профиль для проверки" if testing else "Ваш VPN-доступ"
+        if access.kind == "incy":
+            if not access.connection_uri or not access.routing_link:
+                raise ValueError("VPN gateway returned incomplete INCY access")
+            if platform not in PLATFORMS:
+                raise ValueError("Unsupported subscription platform")
+            platform_note = (
+                "На Android вручную оставьте только Brawl Stars в выборе "
+                "приложений для VPN в INCY (com.supercell.brawlstars)."
+                if platform == "android"
+                else "На iOS нельзя выбрать одно приложение: профиль использует "
+                "домены и IP игры. Ограничение только по приложению не гарантируется."
+            )
+            await self.bot.send_message(
+                chat_id,
+                f"{label} действует до {expiry}.\n\n"
+                "1. Установите INCY.\n"
+                "2. Скопируйте ключ из следующего сообщения и добавьте соединение "
+                "в INCY из буфера обмена.\n"
+                "3. Отдельно импортируйте ссылку маршрутизации из третьего сообщения "
+                "и активируйте этот профиль.\n\n"
+                f"{platform_note}\n\n"
+                "Профиль направляет адреса игры через VPN, остальной интернет — "
+                "напрямую. Проверка IP в браузере обычно показывает ваш исходный IP.\n\n"
+                "Не передавайте ключ и профиль другим людям.",
+                protect_content=False,
+            )
+            await self._send_copyable_link(
+                chat_id,
+                "Ключ подключения INCY",
+                access.connection_uri,
+                "incy-connection.txt",
+            )
+            await self._send_copyable_link(
+                chat_id,
+                "Маршрутизация INCY: импортируйте и активируйте профиль",
+                access.routing_link,
+                "incy-routing.txt",
+            )
+            return
+        if access.kind != "wireguard":
+            raise ValueError("Unsupported VPN access format")
         if platform == "android":
             profile = access.android_config
             instructions = (
@@ -215,8 +259,6 @@ class DeliveryService:
             raise ValueError("Unsupported subscription platform")
         if not profile:
             raise ValueError("VPN gateway returned an empty profile")
-        expiry = expires_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-        label = "Профиль для проверки" if testing else "Ваш VPN-доступ"
         await self.bot.send_document(
             chat_id=chat_id,
             document=BufferedInputFile(profile.encode("utf-8"), filename=filename),
@@ -226,6 +268,24 @@ class DeliveryService:
             ),
             protect_content=False,
         )
+
+    async def _send_copyable_link(
+        self, chat_id: int, label: str, value: str, filename: str
+    ) -> None:
+        if len(value) <= 3500:
+            await self.bot.send_message(
+                chat_id,
+                f"{escape(label)}:\n<code>{escape(value)}</code>",
+                parse_mode="HTML",
+                protect_content=False,
+            )
+        else:
+            await self.bot.send_document(
+                chat_id,
+                document=BufferedInputFile(value.encode("utf-8"), filename=filename),
+                caption=f"{label}. Откройте файл и скопируйте ссылку целиком.",
+                protect_content=False,
+            )
 
     async def test_access(self, user_id: int, platform: str) -> None:
         """Issue an admin's short test without creating a purchase or editing payments."""

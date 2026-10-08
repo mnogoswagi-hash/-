@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from html import escape
 from unittest.mock import AsyncMock
 
 import pytest
@@ -39,6 +40,7 @@ class RecordingSession(BaseSession):
         super().__init__()
         self.requests = []
         self.fail_document_once = False
+        self.fail_routing_once = False
 
     async def close(self):
         pass
@@ -51,6 +53,13 @@ class RecordingSession(BaseSession):
         if isinstance(method, SendDocument) and self.fail_document_once:
             self.fail_document_once = False
             raise TelegramNetworkError(method=method, message="Test transport failure")
+        if (
+            isinstance(method, SendMessage)
+            and self.fail_routing_once
+            and method.text.startswith("Маршрутизация INCY")
+        ):
+            self.fail_routing_once = False
+            raise TelegramNetworkError(method=method, message="Test routing delivery failure")
         if isinstance(method, (SendMessage, SendInvoice, SendDocument)):
             return Message(
                 message_id=len(self.requests),
@@ -221,6 +230,134 @@ async def test_paid_access_survives_provisioning_failure_without_double_extensio
     await dispatcher.feed_update(bot, paid_update(order, update_id=11))
     assert store.get_subscription(1).expires_at == expiry
     assert sum(isinstance(item, SendDocument) for item in session.requests) == 1
+
+
+def incy_access(*, routing_link=None):
+    return VPNAccess(
+        kind="incy",
+        connection_uri=(
+            "vless://11111111-1111-4111-8111-111111111111@vpn.example:443"
+            "?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision"
+            "&sni=cover.example&pbk=test-public-key&sid=0123456789abcdef&fp=chrome"
+            "#Brawl%20Stars"
+        ),
+        routing_link=routing_link or "incy://routing?data=test-routing-data",
+    )
+
+
+@pytest.mark.parametrize("platform", ["android", "ios"])
+async def test_incy_paid_delivery_sends_separate_private_copyable_links_and_instructions(
+    app, platform, caplog
+):
+    _, store, vpn, session, _, delivery, _ = app
+    access = incy_access()
+    vpn.ensure_access.return_value = access
+    order = store.create_order(1, 1, platform, 80)
+    store.accept_payment(order.id, 1, "XTR", 80, "incy-paid-charge")
+    expiry = store.get_subscription(1).expires_at
+    assert await delivery.deliver(1)
+
+    messages = [item for item in session.requests if isinstance(item, SendMessage)]
+    assert len(messages) == 3
+    assert all(item.chat_id == 1 and item.protect_content is False for item in messages)
+    instructions, key_message, route_message = messages
+    assert expiry.strftime("%d.%m.%Y %H:%M UTC") in instructions.text
+    assert "Установите INCY" in instructions.text
+    assert "из буфера обмена" in instructions.text
+    assert "Отдельно импортируйте" in instructions.text
+    assert "активируйте этот профиль" in instructions.text
+    assert "остальной интернет — напрямую" in instructions.text
+    assert "Проверка IP в браузере" in instructions.text
+    assert "WireGuard" not in instructions.text
+    if platform == "android":
+        assert "вручную оставьте только Brawl Stars" in instructions.text
+    else:
+        assert "На iOS нельзя выбрать одно приложение" in instructions.text
+    assert key_message.parse_mode == "HTML"
+    assert f"<code>{escape(access.connection_uri)}</code>" in key_message.text
+    assert route_message.parse_mode == "HTML"
+    assert f"<code>{escape(access.routing_link)}</code>" in route_message.text
+    assert access.connection_uri not in caplog.text
+    assert access.routing_link not in caplog.text
+    assert not any(isinstance(item, SendDocument) for item in session.requests)
+    assert not store.pending_subscriptions()
+    assert store.get_subscription(1).notified_until == expiry
+
+
+async def test_incy_admin_test_uses_same_one_hour_links_without_a_purchase(app):
+    app = configured_app(app, sales_enabled=False, admin_ids=(1,))
+    _, store, vpn, session, bot, _, dispatcher = app
+    access = incy_access()
+    vpn.ensure_access.return_value = access
+    before = datetime.now(timezone.utc)
+    await dispatcher.feed_update(
+        bot, Update(update_id=1, message=private_message(text="/testvpn ios"))
+    )
+    vpn.ensure_access.assert_awaited_once()
+    user_id, expiry = vpn.ensure_access.await_args.args
+    assert user_id == 1
+    assert before + timedelta(hours=1) <= expiry <= datetime.now(timezone.utc) + timedelta(hours=1)
+    messages = [item for item in session.requests if isinstance(item, SendMessage)]
+    assert len(messages) == 3
+    assert "Профиль для проверки" in messages[0].text
+    assert expiry.strftime("%d.%m.%Y %H:%M UTC") in messages[0].text
+    assert escape(access.connection_uri) in messages[1].text
+    assert escape(access.routing_link) in messages[2].text
+    assert store.get_subscription(1) is None
+    assert store.connection.execute("SELECT count(*) FROM orders").fetchone()[0] == 0
+    assert store.connection.execute("SELECT count(*) FROM payments").fetchone()[0] == 0
+
+
+async def test_long_incy_routing_link_is_delivered_whole_as_separate_text_file(app):
+    _, store, vpn, session, _, delivery, _ = app
+    access = incy_access(routing_link="incy://routing?data=" + "A" * 4000)
+    vpn.ensure_access.return_value = access
+    order = store.create_order(1, 1, "android", 80)
+    store.accept_payment(order.id, 1, "XTR", 80, "long-routing-charge")
+    await delivery.deliver(1)
+    messages = [item for item in session.requests if isinstance(item, SendMessage)]
+    assert len(messages) == 2
+    assert escape(access.connection_uri) in messages[1].text
+    documents = [item for item in session.requests if isinstance(item, SendDocument)]
+    assert len(documents) == 1
+    document = documents[0]
+    assert document.chat_id == 1
+    assert document.document.filename == "incy-routing.txt"
+    assert document.document.data == access.routing_link.encode("utf-8")
+    assert document.protect_content is False
+    assert "скопируйте ссылку целиком" in document.caption
+    assert access.connection_uri.encode() not in document.document.data
+    assert not store.pending_subscriptions()
+
+
+async def test_incy_partial_delivery_retries_without_losing_the_paid_subscription(app):
+    _, store, vpn, session, _, delivery, _ = app
+    access = incy_access()
+    vpn.ensure_access.return_value = access
+    order = store.create_order(1, 1, "ios", 80)
+    store.accept_payment(order.id, 1, "XTR", 80, "partial-incy-charge")
+    expiry = store.get_subscription(1).expires_at
+    session.fail_routing_once = True
+    with pytest.raises(TelegramNetworkError):
+        await delivery.deliver(1)
+    assert store.get_subscription(1).provisioned_until == expiry
+    assert store.get_subscription(1).notified_until is None
+    assert len(store.pending_subscriptions()) == 1
+    await delivery.deliver(1)
+    assert not store.pending_subscriptions()
+    assert store.get_subscription(1).expires_at == expiry
+    assert store.connection.execute("SELECT count(*) FROM payments").fetchone()[0] == 1
+
+
+async def test_incomplete_incy_access_stays_pending_without_sending_a_partial_key(app):
+    _, store, vpn, session, _, delivery, _ = app
+    vpn.ensure_access.return_value = VPNAccess(kind="incy", connection_uri="private-key")
+    order = store.create_order(1, 1, "android", 80)
+    store.accept_payment(order.id, 1, "XTR", 80, "incomplete-incy-charge")
+    with pytest.raises(ValueError):
+        await delivery.deliver(1)
+    assert not session.requests
+    assert store.get_subscription(1).notified_until is None
 
 
 async def test_telegram_delivery_failure_is_retried_and_myvpn_can_resend(app):

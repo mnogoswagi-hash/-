@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brawl-vpn-shop"
-version = "0.1.0"
-description = "Telegram Stars shop with a restricted WireGuard gateway"
+version = "0.2.0"
+description = "Telegram Stars shop with restricted WireGuard and Incy VLESS gateways"
 requires-python = ">=3.10"
 dependencies = [
   "aiogram==3.31.0",
@@ -18,7 +18,7 @@ dependencies = [
 dev = ["pytest==8.4.2", "pytest-asyncio==1.2.0", "ruff==0.14.0"]
 
 [tool.setuptools.packages.find]
-include = ["vpn_shop*", "vpn_gateway*"]
+include = ["vpn_shop*", "vpn_gateway*", "brawl_proxy*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
